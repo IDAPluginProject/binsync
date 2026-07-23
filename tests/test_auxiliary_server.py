@@ -14,8 +14,6 @@ from declib.ui.qt_objects import (
 import unittest
 import threading
 import time
-import socket
-from werkzeug.serving import make_server
 from contextlib import contextmanager
 from declib.artifacts import Artifact, Context
 
@@ -57,14 +55,14 @@ class ServerThreadManager():
     Implementation of the server that enables shutting down the server in between tests
     """
     def __init__(self, server:Server):
-        self.server = make_server(server.host, server.port, server.app)
+        self.server = server
         
     def enter(self):
-        self._thread = threading.Thread(target=self.server.serve_forever)
+        self._thread = threading.Thread(target=self.server.run)
         self._thread.start()
         
     def exit(self):
-        self.server.shutdown()
+        self.server.stop()
         self._thread.join()
 
 class MockUser(QWidget):
@@ -110,14 +108,22 @@ class MockUser(QWidget):
         self.stop_signal.emit()
 
     @Slot(dict)
-    def _update_beliefs(self, new_beliefs):
+    def _update_beliefs(self, new_beliefs: dict[str, dict[str, int | None]]):
         self.beliefs = new_beliefs
         
     @Slot(dict)
     def _update_linked_projects(self, new_projects_list):
         self.linked_projects = new_projects_list
         
-
+# NOTE: While working on these test cases, I noticed an issue with 
+# the server starting up only after clients attempt connecting 
+# (e.g. https://github.com/binsync/binsync/actions/runs/28305215535/job/83860138903).
+# This seems to have been fixed by adding a sleep after the call to start
+# the server (self.server_thread_manager.enter()) and prior to having the user 
+# connect (connect_signal.emit((HOST, PORT))), but because the other 
+# test cases have not exhibited this issue I did not implement this for 
+# the other test cases. If the issue shows up again, add the sleep for other
+# test cases as well.
 class TestAuxServer(unittest.TestCase):
     HOST = "127.0.0.1"
     PORT = 7962
@@ -156,7 +162,6 @@ class TestAuxServer(unittest.TestCase):
         self.server_thread_manager.enter()
         time.sleep(1)
         assert server.store._user_map == {} # Validate that the initial map of user functions is empty
-        assert server.store._user_count == 0 # Validate that the initial user count is 0
         
     def test_single_connection(self):
         """
@@ -166,14 +171,22 @@ class TestAuxServer(unittest.TestCase):
         server = Server(self.HOST, self.PORT)
         self.server_thread_manager = ServerThreadManager(server)
         self.server_thread_manager.enter()
-        self.users.append(MockUser(MockController("Alice")))
+        controller = MockController("Alice")
+        self.users.append(MockUser(controller))
         
         self.users[0].connect_signal.emit((self.HOST, self.PORT))
         time.sleep(1)
-        assert server.store._user_count == 1 # Verify that the server received the connection
+        # Verify that the server received the connection
+        assert server.store.get_user_data()[0] == { # pyright: ignore[reportOptionalSubscript]
+            "Alice": {
+                "addr": controller.deci._context.addr,
+                "func_addr": controller.deci._context.func_addr,
+            }
+        } 
         self.users[0].stop_signal.emit()
         time.sleep(1)
-        assert server.store._user_count == 0 # Verify that server received disconnection
+        # Verify that server received disconnection
+        assert server.store.get_user_data()[0] == {}  # pyright: ignore[reportOptionalSubscript]
     
     def test_many_connections(self):
         """
@@ -199,7 +212,7 @@ class TestAuxServer(unittest.TestCase):
             user.connect_signal.emit((self.HOST, self.PORT))
         time.sleep(2)
         # Make sure that each user's function context is present in the server's storage
-        contexts_dict, _ = server.store.getUserData()
+        contexts_dict, _ = server.store.get_user_data()
         for controller in controllers:
             user_entry = contexts_dict[controller.client.master_user]
             assert user_entry["addr"] == controller.deci._context.addr
@@ -212,13 +225,14 @@ class TestAuxServer(unittest.TestCase):
         server = Server(self.HOST, self.PORT)
         self.server_thread_manager = ServerThreadManager(server)
         self.server_thread_manager.enter()
+        time.sleep(1)
         controller = MockController("Alice")
         self.users.append(MockUser(controller))
         for user in self.users:
             user.connect_signal.emit((self.HOST, self.PORT))
         time.sleep(1)
         
-        contexts_dict, _ = server.store.getUserData()
+        contexts_dict, _ = server.store.get_user_data()
         user_entry = contexts_dict[controller.client.master_user]
         assert user_entry["addr"] == controller.deci._context.addr
         assert user_entry["func_addr"] == controller.deci._context.func_addr
@@ -230,7 +244,7 @@ class TestAuxServer(unittest.TestCase):
         })
         time.sleep(1)
         
-        contexts_dict, _ = server.store.getUserData()
+        contexts_dict, _ = server.store.get_user_data()
         user_entry = contexts_dict[controller.client.master_user]
         assert user_entry["addr"] == controller.deci._context.addr
         assert user_entry["func_addr"] == controller.deci._context.func_addr
@@ -264,7 +278,7 @@ class TestAuxServer(unittest.TestCase):
         for i in range(len(self.users)-1):
             assert self.users[i].beliefs == self.users[i+1].beliefs
         # Make sure everyone's beliefs match up with the server
-        assert self.users[0].beliefs == server.store._user_map  
+        assert self.users[0].beliefs == server.store.get_user_data()[0] # pyright: ignore[reportOptionalSubscript]
     
     # Modifications to ClientWorker broke these tests so they are disabled for now.
     def test_link_unlink_projects(self):
@@ -347,7 +361,7 @@ class TestAuxServer(unittest.TestCase):
         
         # Client A links project
         user_a.link_project.emit((project_url, ServerStore.DEFAULT_GROUPNAME))
-        time.sleep(0.5) # Give time for server to receive the project
+        time.sleep(1) # Give time for server to receive the project
         
         # Client B lists out projects
         user_b.list_projects.emit()
@@ -361,7 +375,7 @@ class TestAuxServer(unittest.TestCase):
         
         # Client C unlinks project
         user_c.unlink_project.emit((project_url, ServerStore.DEFAULT_GROUPNAME))
-        time.sleep(0.5) # Give time for server to receive the unlink
+        time.sleep(1) # Give time for server to receive the unlink
         
         # Client B lists out projects
         user_b.list_projects.emit()
@@ -371,5 +385,69 @@ class TestAuxServer(unittest.TestCase):
             ServerStore.DEFAULT_GROUPNAME: {}
         }
             
+    def test_clean_inactive_users(self):
+        '''
+        User A connects, then User B connects, then User C connects.
+        User A explicitly disconnects, then User B silently disconnects.
+        Only User C should remain.
+        '''
+        server = Server(self.HOST, self.PORT, inactive_poll_sec=1, inactive_timeout_sec=2)
+        self.server_thread_manager = ServerThreadManager(server)
+        self.server_thread_manager.enter()
+        time.sleep(1) # Sleep so server can start up properly or something
+        controllers:list[MockController] = []
+        controllers.append(MockController("Alice"))
+        controllers.append(MockController("Bob"))
+        controllers.append(MockController("Carol"))
+
+        for i, controller in enumerate(controllers):
+            controller.deci._update_context({
+                "address":0x40000+10*i,
+                "function_address":0x500000+10*i
+            })
+            self.users.append(MockUser(controller))
+        
+        for user in self.users:
+            user.connect_signal.emit((self.HOST, self.PORT))
+
+        time.sleep(1)
+        
+        assert server.store.get_user_data()[0] == { # pyright: ignore[reportOptionalSubscript]
+            controller.client.master_user: {
+                "addr": controller.deci._context.addr,
+                "func_addr": controller.deci._context.func_addr,
+            } for controller in controllers
+        }
+
+        # Make Alice disconnect naturally
+        self.users[0].shutdown()
+        time.sleep(1) # Time for worker to emit finished signal
+        self.app.processEvents() # Process events so that threads can receive the finished signal
+        self.users = self.users[1:]
+        controllers = controllers[1:]
+
+        assert server.store.get_user_data()[0] == { # pyright: ignore[reportOptionalSubscript]
+            controller.client.master_user: {
+                "addr": controller.deci._context.addr,
+                "func_addr": controller.deci._context.func_addr,
+            } for controller in controllers
+        }
+
+        # Force stop Bob's thread
+        self.users[0].thread.quit()
+        time.sleep(1) # Time for worker to emit finished signal
+        self.app.processEvents() # Process events so that threads can receive the finished signal
+        self.users = self.users[1:]
+        controllers = controllers[1:]
+
+        time.sleep(2) # Additional time for server to notice that user has stopped contacting server
+        assert server.store.get_user_data()[0] == { # pyright: ignore[reportOptionalSubscript]
+            controller.client.master_user: {
+                "addr": controller.deci._context.addr,
+                "func_addr": controller.deci._context.func_addr,
+            } for controller in controllers
+        }
+        
+
 if __name__ == "__main__":
     unittest.main(argv=sys.argv)

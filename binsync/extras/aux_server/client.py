@@ -29,13 +29,16 @@ class ServerClient():
         self.old_post_data = {}
         self.connected = False
         self.callback_registered = False
-
+        
+    
+    # Try connecting to the server. Return True on successful connection and False on fail.
     def connect(self):
         self.server_url = f"http://{self.host}:{self.port}"
-        self._etag = None
         parsed = urllib.parse.urlparse(self.server_url)
         if parsed.netloc != f"{self.host}:{self.port}":
             l.error("HOST AND PORT COMBINATION IS NOT VALID: NETLOC %s BUT HOST %s AND PORT %s",parsed.netloc,parsed.hostname,parsed.port)
+            return False
+
         self.sess = requests.Session()
         try:
             client_version_nums = aux_server.__version__.split(".")
@@ -61,17 +64,26 @@ class ServerClient():
         except ValueError as e:
             l.error("Tried to get version from auxiliary server but response was malformed. Encountered error: %s", e)
             return False
+        
+        try:
+            username = self.controller.client.master_user
+        except AttributeError:
+            l.error("Tried to access username but was not set")
+            return False
 
+        self._etag = None
+        self.sess.cookies.set("user", username)
         try:
             l.info(self.sess.get(self.server_url+"/connect").text)
-            self.connected = True
-            self.controller.deci.artifact_change_callbacks[Context].append(self._submit_new_context)
-            self.callback_registered = True
-            self._submit_new_context(self.controller.deci.gui_active_context())
-            return True
-        except requests.ConnectionError:
-            l.info("Unable to establish a connection with the auxiliary server")
+        except requests.ConnectionError as e:
+            l.error("Tried to connect to server at self.server_url but received error %s", e)
             return False
+        self.connected = True
+        self.controller.deci.artifact_change_callbacks[Context].append(self._submit_new_context)
+        self.callback_registered = True
+        self._submit_new_context(self.controller.deci.gui_active_context())
+        return True
+        
 
     @_connection_required
     def poll_users_data(self):
@@ -88,7 +100,7 @@ class ServerClient():
                 "If-None-Match":str(self._etag)
             })
             if r.status_code != 304:
-                self.users_data = r.json()
+                self.users_data:dict[str, dict[str, int | None]] = r.json()
                 self._etag = r.headers["ETag"]
                 l.info(self.users_data)
         return self.users_data
@@ -100,8 +112,6 @@ class ServerClient():
             post_data["address"] = context.addr
         if context.func_addr:
             post_data["function_address"] = context.func_addr
-        if self.controller.client:
-            post_data["username"] = self.controller.client.master_user
         if post_data != self.old_post_data: # No need to do extra communication with server if no change
             try:
                 self.sess.post(self.server_url+"/function",data=post_data)
@@ -206,9 +216,14 @@ class ServerClient():
             self.callback_registered = False
         if self.connected:
             try:
-                l.info(self.sess.get(self.server_url+"/disconnect").text)
+                disconnect_resp = self.sess.get(self.server_url+"/disconnect")
+                disconnect_resp.raise_for_status()
+                l.info("%s", disconnect_resp.text)
             except requests.ConnectionError:
-                l.info("Server unresponsive")
-            self.connected = False
+                l.info("Server unresponsive (considering to be disconnected)")
+            except requests.HTTPError:
+                l.info(f"Disconnected strangely: Server returned {disconnect_resp.text}") # pyright: ignore[reportPossiblyUnboundVariable]
+            finally:
+                self.connected = False
         else:
             l.info("Disconnected without contacting server as it was previously unreachable")
